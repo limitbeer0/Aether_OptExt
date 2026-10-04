@@ -16,6 +16,7 @@ mod proccache;
 mod common;
 mod rule_match;
 mod inotify;
+mod lagrange;
 
 use config::*;
 use cpuset::CpuSet;
@@ -367,6 +368,10 @@ fn main() {
     }
 
     info!("mode: {}", if bpf_state.ok { "eBPF event-driven" } else { "proc polling" });
+
+    // λmod 初始化（perf_event 不可用或关闭时自动回退 tick 启发式）
+    let lagrange_ok = lagrange::init(&cfg.topo, cfg.lagrange_enable);
+    if lagrange_ok { info!("λmod active (perf_event + lagrangian)"); }
 
     // 启动即清扫：把上次运行残留在 OptExt 分组内的黑名单线程释放
     for tid in proccache::ProcCache::release_blacklisted_orphans(&cfg, &cfg.topo) {

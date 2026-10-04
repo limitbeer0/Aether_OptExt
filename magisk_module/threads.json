@@ -6,7 +6,9 @@
     "load_aware": true,
     "notify_scheduler": true,
     "blacklist": [],
-    "render_guard": true
+    "render_guard": true,
+    "min_cpus": 4,
+    "lagrange": { "enable": true }
   },
   "rules": [
     {

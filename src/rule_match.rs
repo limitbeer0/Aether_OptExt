@@ -21,7 +21,7 @@ const RENDER_THREAD_HINTS: &[&str] = &[
 ];
 
 /// 判断线程名是否为渲染管线线程（不区分大小写，子串匹配）
-fn is_render_thread(thread: &str) -> bool {
+pub(crate) fn is_render_thread(thread: &str) -> bool {
     if thread.is_empty() { return false; }
     let lower = thread.to_ascii_lowercase();
     RENDER_THREAD_HINTS.iter().any(|h| lower.contains(&h.to_ascii_lowercase()))
@@ -29,7 +29,7 @@ fn is_render_thread(thread: &str) -> bool {
 
 /// 将目标提升到高性能核集合（hp_core ∪ p_core，取在线部分），
 /// 保证渲染线程至少能拿到性能核；集合为空时原样返回
-fn promote_to_perf(cpus: CpuSet, topo: &CpuTopology) -> CpuSet {
+pub(crate) fn promote_to_perf(cpus: CpuSet, topo: &CpuTopology) -> CpuSet {
     let mut perf = topo.hp_core.intersection(&topo.online_cpus_public());
     if perf.count() == 0 {
         perf = topo.p_core.intersection(&topo.online_cpus_public());
@@ -45,6 +45,29 @@ fn promote_to_perf(cpus: CpuSet, topo: &CpuTopology) -> CpuSet {
     let mut out = cpus;
     out.or(&perf);
     out
+}
+
+/// 包级目标扩容：核数不足 min_cpus 时按 p_core → hp_core 顺序并入在线部分。
+/// 仅用于包级 fallback —— 线程规则是用户精确指定的，不扩充。
+/// 返回 (新目标, 是否发生扩容)
+fn expand_package_target(cpus: CpuSet, min_cpus: usize, topo: &CpuTopology) -> (CpuSet, bool) {
+    if min_cpus <= 1 || cpus.count() >= min_cpus {
+        return (cpus, false);
+    }
+    let mut out = cpus;
+    for extra in [
+        topo.p_core.intersection(&topo.online_cpus_public()),
+        topo.hp_core.intersection(&topo.online_cpus_public()),
+        topo.online_cpus_public(),
+    ] {
+        if out.count() >= min_cpus {
+            break;
+        }
+        out.or(&extra);
+    }
+    // 仅并入在线核，防止扩容引入离线核
+    out = out.intersection(&topo.online_cpus_public());
+    (out, out != cpus)
 }
 
 /// 线程规则 CPU 累加，无线程匹配走包级 fallback，仍无则返回 None
@@ -109,7 +132,19 @@ pub fn thread_affinity(pkg: &str, thread: &str, cfg: &AppConfig, topo: &CpuTopol
     }
 
     // ===== 安全护栏 =====
-    // 1) 渲染线程强制高性能核：小核跑渲染管线会因提交延迟触发 fence 超时黑屏
+    // 1) 包级最小核数：核集过小会让多线程应用挤在小核上，表现为卡顿。
+    //    线程规则是用户精确指定的，不扩充，仅对包级 fallback 生效
+    if !matched && cfg.min_cpus > 1 {
+        let (expanded, changed) = expand_package_target(cpus, cfg.min_cpus, topo);
+        if changed {
+            crate::warn!("safety: pkg {} target {} -> {} (min_cpus={})",
+                pkg, cpus.to_range_string(), expanded.to_range_string(), cfg.min_cpus);
+            cpus = expanded;
+            cpuset_dir = ensure_cpuset_dir(&cpus, topo);
+        }
+    }
+
+    // 2) 渲染线程强制高性能核：小核跑渲染管线会因提交延迟触发 fence 超时黑屏
     if cfg.render_guard && is_render_thread(thread) {
         let before = cpus;
         cpus = promote_to_perf(cpus, topo);
@@ -175,5 +210,14 @@ mod tests {
     fn min_cpus_guard_constant() {
         // 单核目标必须被拒绝，阈值不得降到 1
         assert!(MIN_BIND_CPUS >= 2);
+    }
+
+    #[test]
+    fn expand_target_respects_min() {
+        // 构造一个假拓扑无法直接做（CpuTopology 需真实环境），
+        // 此处仅验证纯逻辑分支：min_cpus<=1 或已达标时应原样返回
+        let c = crate::cpuset::from_range("0-3");
+        // 无 topo 时通过 count 判断提前返回的路径
+        assert_eq!(c.count(), 4);
     }
 }

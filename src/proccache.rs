@@ -21,6 +21,9 @@ pub struct TaskEntry {
     cap: CpuSet,
     /// cap 已持续周期数，超过 CAP_TTL 清空重探
     cap_age: u8,
+    /// 该线程名命中渲染管线特征。渲染线程任何路径下都不得被压到小核，
+    /// 否则提交延迟会触发 fence 超时 → BufferQueue 断流黑屏
+    is_render: bool,
 }
 
 /// cap 存活周期数：到期后重探一次，保证核/分组恢复时能扩回配置目标
@@ -121,6 +124,7 @@ impl ProcCache {
             prev_ticks: 0,
             cap,
             cap_age: 0,
+            is_render: crate::rule_match::is_render_thread(comm),
         });
         true
     }
@@ -132,6 +136,18 @@ impl ProcCache {
         let topo = &cfg.topo;
         if e.is_thread_rule { return; }
 
+        // is_render 动态刷新：FORK 时 comm 仍是进程名，线程随后才被改名成
+        // RenderThread。eBPF 的 task_rename 是 optional hook（可能 attach 失败），
+        // 此时快照不会更新、渲染保护失效。故按需重读 comm，一经确认即永久置位。
+        if !e.is_render {
+            if let Some(c) = process::tid_comm(tid) {
+                if crate::rule_match::is_render_thread(&c) {
+                    e.is_render = true;
+                    crate::warn!("safety: render thread '{}' detected (tid={}), guard armed", c, tid);
+                }
+            }
+        }
+
         // 内核限缩过的目标优先（后台降档同样受其约束）
         let clamp = |e: &TaskEntry, want: CpuSet| -> CpuSet {
             if e.cap.count() == 0 { return want; }
@@ -139,9 +155,24 @@ impl ProcCache {
             if c.count() == 0 { e.cap } else { c }
         };
 
-        // 后台降档
+        // 渲染线程保护：任何路径给出的目标都不得把渲染线程压到小核。
+        // λmod / load_aware / 后台降档都可能给出能效核目标，必须统一拦截，
+        // 否则 task_apply 阶段的 render_guard 提升会被后续周期覆盖掉。
+        //
+        // 注意顺序：guard 是软约束（应当用什么核），clamp 是硬约束（内核允许
+        // 什么核）。必须先 guard 再 clamp —— promote_to_perf 会并入性能核，
+        // 若放在 clamp 之后，并入的核可能落在 cap 之外而再次撞 EINVAL
+        let guard = |want: CpuSet| -> CpuSet {
+            if e.is_render {
+                crate::rule_match::promote_to_perf(want, topo)
+            } else {
+                want
+            }
+        };
+
+        // 后台降档（经 guard，避免渲染线程在 cached 瞬间被打进小核）
         if cfg.foreground_aware && is_bg {
-            let want = clamp(e, topo.e_core);
+            let want = clamp(e, guard(topo.e_core));
             if want.count() > 0 && want != e.cpus {
                 e.cpus = want;
                 e.cpuset_dir = ensure_cpuset_dir(&want, topo);
@@ -149,8 +180,21 @@ impl ProcCache {
             return;
         }
 
-        // 前台/负载感知
+        // λmod 优先：perf_event 实测 + 拉格朗日求解给出的层目标。
+        // 未启用/未采样到时回退下方 tick 启发式
         let mut desired = e.base_cpus;
+        if crate::lagrange::active() {
+            if let Some(t) = crate::lagrange::target_for(tid) {
+                if t.count() > 0 {
+                    let t = clamp(e, guard(t));
+                    if t != e.cpus {
+                        e.cpus = t;
+                        e.cpuset_dir = ensure_cpuset_dir(&t, topo);
+                    }
+                    return;
+                }
+            }
+        }
         if cfg.load_aware && elapsed_ticks > 0 {
             if let Some(ticks) = process::read_thread_cpu_time(tid) {
                 if e.prev_ticks > 0 {
@@ -169,7 +213,7 @@ impl ProcCache {
             }
         }
 
-        let desired = clamp(e, desired);
+        let desired = clamp(e, guard(desired));
         if desired != e.cpus {
             e.cpus = desired;
             e.cpuset_dir = ensure_cpuset_dir(&desired, topo);
@@ -212,6 +256,12 @@ impl ProcCache {
                 })
                 .collect()
         };
+
+        // λmod 周期推进：采样 → 求解 → 推进 λ → 刷新目标缓存
+        if crate::lagrange::active() {
+            let tids: Vec<i32> = self.tasks.keys().copied().collect();
+            crate::lagrange::tick(&tids, cfg);
+        }
 
         let mut dead_tids = Vec::new();
         let mut released = 0usize;

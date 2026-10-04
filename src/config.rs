@@ -77,6 +77,13 @@ pub struct AppConfig {
     pub blacklist: HashSet<String>,
     /// 渲染安全护栏：渲染线程强制高性能核 + 拒绝单核绑核，防 fence 超时黑屏（默认 true）
     pub render_guard: bool,
+    /// 包级绑核目标的最小核数（默认 4）。目标不足时按 p_core → hp_core 顺序并入。
+    /// 核集过小会让多线程应用挤在小核上导致卡顿；设为 1 可禁用。
+    /// 仅作用于包级 other，用户手写的线程规则不扩充
+    pub min_cpus: usize,
+    /// λmod：基于拉格朗日乘子 + perf_event 实测的绑核求解（默认 true）。
+    /// 开启时取代 load_aware 的 tick 启发式
+    pub lagrange_enable: bool,
 }
 
 impl AppConfig {
@@ -137,6 +144,12 @@ impl AppConfig {
         let notify_scheduler = root["features"]["notify_scheduler"].as_bool().unwrap_or(true);
         // 渲染安全护栏：默认开启，防单核/小核渲染导致 fence 超时黑屏
         let render_guard = root["features"]["render_guard"].as_bool().unwrap_or(true);
+        // 包级最小核数：默认 4，防止多线程应用全挤在小核上卡顿
+        let min_cpus = root["features"]["min_cpus"].as_u64().unwrap_or(4).max(1) as usize;
+        // λmod：默认开启，用 perf_event 实测替代 tick 启发式
+        let lagrange_enable = root["features"]["lagrange"]["enable"].as_bool()
+            .or_else(|| root["features"]["lagrange"].as_bool())
+            .unwrap_or(true);
         // 用户黑名单：features.blacklist 数组，列入的包名完全不受控
         let blacklist: HashSet<String> = root["features"]["blacklist"].members()
             .filter_map(|v| v.as_str())
@@ -188,7 +201,7 @@ impl AppConfig {
             rules, pkg_set, wild, mtime: mt, ebpf, topo: topo.clone(),
             asoul_ignore: HashSet::new(),
             foreground_aware, load_aware, notify_scheduler,
-            blacklist, render_guard,
+            blacklist, render_guard, min_cpus, lagrange_enable,
         };
         cfg.apply_blacklist();
         cfg.apply_asoul_ignore();

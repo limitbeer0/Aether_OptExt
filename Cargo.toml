@@ -17,3 +17,5 @@ opt-level = 3
 libc = "0.2"
 json = "0.12"
 aya = "0.14"
+dashmap = "6"
+rayon = "1"
