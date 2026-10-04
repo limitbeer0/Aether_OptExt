@@ -45,8 +45,17 @@ fn comm_str(comm: &[u8; 16]) -> String {
 static FG_HINTED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i32, u64>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// 已通知的包名 → 上次通知时刻(ms)。
+/// usap64 等预加载服务会高频 fork 短命进程，每次都是新 pid，纯 pid 级去重
+/// 完全失效（实测单个 usap64 占日志 46%）。包级 TTL 用于压住这类刷屏。
+static FG_HINTED_PKG: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 /// 同 pid 通知节流窗口：窗口内重复触发直接跳过
 const FG_HINT_TTL_MS: u64 = 10_000;
+/// 同包通知节流窗口。短命进程换 pid 后仍会被此窗口拦住，
+/// 取值需明显大于 pid 级 TTL，否则高频 fork 的服务仍会刷屏
+const FG_HINT_PKG_TTL_MS: u64 = 60_000;
 /// 去重表容量上限，超限时清理过期项
 const FG_HINT_CAP: usize = 4096;
 
@@ -62,6 +71,8 @@ fn notify_fg_change(pkg: &str, pid: i32) -> bool {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    // 包名取基础包，使 com.x:X 与 com.x:Y 共享同一窗口
+    let base = pkg.split(':').next().unwrap_or(pkg).to_string();
     {
         let mut seen = FG_HINTED.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(&t) = seen.get(&pid) {
@@ -73,6 +84,19 @@ fn notify_fg_change(pkg: &str, pid: i32) -> bool {
             seen.retain(|_, &mut t| now.saturating_sub(t) < FG_HINT_TTL_MS);
         }
         seen.insert(pid, now);
+    }
+    // 包级节流：命中则不写盘也不记日志
+    {
+        let mut seen = FG_HINTED_PKG.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(&t) = seen.get(&base) {
+            if now.saturating_sub(t) < FG_HINT_PKG_TTL_MS {
+                return false;
+            }
+        }
+        if seen.len() > FG_HINT_CAP {
+            seen.retain(|_, &mut t| now.saturating_sub(t) < FG_HINT_PKG_TTL_MS);
+        }
+        seen.insert(base, now);
     }
     let _ = std::fs::write(
         "/sdcard/Android/Aether/fg_hint",

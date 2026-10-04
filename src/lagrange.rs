@@ -41,8 +41,12 @@ const PERF_TYPE_RAW: u32 = 4;
 const PERF_COUNT_HW_INSTRUCTIONS: u64 = 0;
 const PERF_COUNT_HW_CPU_CYCLES: u64 = 1;
 const PERF_COUNT_SW_CONTEXT_SWITCHES: u64 = 1;
-const RAW_LL_CACHE_RD: u64 = 0x0036;
-const RAW_LL_CACHE_MISS_RD: u64 = 0x0037;
+/// x86 Intel 的 LLC 事件编码（PERF_TYPE_RAW）
+const X86_LL_CACHE_RD: u64 = 0x0036;
+const X86_LL_CACHE_MISS_RD: u64 = 0x0037;
+/// aarch64 标准事件号（armv8_pmuv3）
+const ARM_L2D_CACHE: u64 = 0x0016;
+const ARM_L2D_CACHE_REFILL: u64 = 0x0017;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -211,7 +215,12 @@ impl Lambda {
             if e > best_p { best_p = e; best_k = kk; }
         }
         for p in probs.iter_mut() { *p /= exp_sum; }
-        let w = (min_pi - t_safe * exp_sum.ln()).exp();
+        // free energy：LSE 形式为 -T·ln(Σexp(-π/T))，其负值即 log-sum-exp 下界。
+        // 权重取 w = exp(-pi_lse) —— 负号不可省：漏掉会写成 exp(+pi_lse)，
+        // π 为大正数时指数爆炸，s[0]=Σw 发散并正反馈到 λ[0]，最终 inf/NaN。
+        // （原先因 s[0]≡1.0 恒小于 cap[0]、λ[0] 被永久钳零而掩盖了此错误）
+        let pi_lse = min_pi - t_safe * exp_sum.ln();
+        let w = (-pi_lse).exp();
         (w, probs, best_k)
     }
 
@@ -234,7 +243,13 @@ impl Lambda {
             .fold(
                 || (vec![0.0f64; m], Vec::new()),
                 |(mut s, mut a), &(tid, c, mm, ins)| {
-                    let (_w, probs, _best) = self.thread_w(&lambdas, c, mm, ins);
+                    let (w, probs, _best) = self.thread_w(&lambdas, c, mm, ins);
+                    // 全局约束按权重加权累加（对齐参考实现）。
+                    // 原先 s[0] 用 Σinsn_share ≡ 1.0，恒等于 1 而失去意义，
+                    // 导致 λ[0] 被永久钳零；s[1]/s[2] 亦未加权
+                    s[0] += w;
+                    s[1] += w * c;
+                    s[2] += w * mm;
                     // 累积量按概率软累加：这是 λ 收敛的前提。
                     // 若按硬分配累加，s 只能取 0/1 两端，永远匹配不了 rho
                     for kk in 0..k {
@@ -255,30 +270,26 @@ impl Lambda {
                 },
             );
 
-        // CPU/LLC/内存三项约束同样按已分配线程的实测值累加
-        let mut s_full = s;
-        for (tid, _best) in &assign {
-            if let Some(nd) = self.nodes.get(tid) {
-                let (c, mm, _) = nd.read();
-                s_full[1] += c;
-                s_full[2] += mm;
-            }
-        }
-        s_full[0] = s_full[3..].iter().sum::<f64>().max(1.0);
         let _ = k;
-        (assign, s_full)
+        (assign, s)
     }
 
     /// 用 solve 的累积量推进 λ 与 gamma
     pub fn advance(&self, s: &[f64]) -> f64 {
         self.step_lambdas(s);
-        // 误差越大 → gamma 越大，加快收敛
+        // 误差只统计层容量约束 s[3..]/rho。s[0..3] 是 CPU/LLC/内存全局约束，
+        // 与层配额的量纲完全不同：s[0] 是权重和（量级随线程数变化）、
+        // s[1]/s[2] 在 PMU 缺事件时会退化为常量。把三者纳入统计会让 err 被
+        // 常数偏差主导 —— 实测恒为 0.90~1.00，而真实层误差仅 0.007~0.020，
+        // 指标完全失去指示作用。
         let mut max_rel = 0.0f64;
-        for r in 0..self.m() {
+        for kk in 0..self.tiers.len() {
+            let r = 3 + kk;
             let cap = self.capacity(r).max(FLOAT_EPS);
             let rel = (s[r] - cap).abs() / cap;
             if rel > max_rel { max_rel = rel; }
         }
+        // 误差越大 → gamma 越大，加快收敛
         let gamma = (1.0 * (1.0 + max_rel)).clamp(0.1, 8.0);
         self.gamma.store(gamma.to_bits(), Ordering::Release);
         max_rel
@@ -434,10 +445,12 @@ fn open_sw(tid: i32, config: u64) -> i32 {
 }
 
 fn open_llc(tid: i32) -> (i32, i32) {
+    let ty = pmu_type();
+    let (ev_rd, ev_miss) = cache_events();
     let one = |config: u64, ex_k: u64| -> i32 {
         let mut attr: perf_event_attr = unsafe { mem::zeroed() };
         attr.size = mem::size_of::<perf_event_attr>() as u32;
-        attr.type_ = PERF_TYPE_RAW; attr.config = config; attr.disabled = 1;
+        attr.type_ = ty; attr.config = config; attr.disabled = 1;
         attr.exclude_hv = 1; attr.exclude_kernel = ex_k;
         let fd = perf_event_open(&mut attr, tid);
         if fd < 0 { return -1; }
@@ -447,13 +460,13 @@ fn open_llc(tid: i32) -> (i32, i32) {
         }
         fd
     };
-    let a = one(RAW_LL_CACHE_RD, 0);
-    let m = one(RAW_LL_CACHE_MISS_RD, 0);
+    let a = one(ev_rd, 0);
+    let m = one(ev_miss, 0);
     if a >= 0 && m >= 0 { return (a, m); }
     if a >= 0 { unsafe { libc::close(a); } }
     if m >= 0 { unsafe { libc::close(m); } }
-    let a2 = one(RAW_LL_CACHE_RD, 1);
-    let m2 = one(RAW_LL_CACHE_MISS_RD, 1);
+    let a2 = one(ev_rd, 1);
+    let m2 = one(ev_miss, 1);
     if a2 >= 0 && m2 >= 0 { return (a2, m2); }
     if a2 >= 0 { unsafe { libc::close(a2); } }
     if m2 >= 0 { unsafe { libc::close(m2); } }
@@ -476,6 +489,45 @@ fn read_pair(a: i32, m: i32) -> Option<(u64, u64)> {
         if libc::read(m, &mut vm as *mut u64 as *mut libc::c_void, 8) != 8 { return None; }
     }
     Some((va, vm))
+}
+
+/// 缓存事件源类型。aarch64 走 armv8_pmuv3（type 通常为 10），x86 走
+/// PERF_TYPE_RAW。读不到时回退 RAW —— 原先固定用 PERF_TYPE_RAW + 0x36/0x37
+/// 是 x86 编码，在 aarch64 上 open 必然失败，导致 c_llc 恒为 fallback 常量、
+/// λ[1]/λ[2] 永久钳零，λmod 丢失全部缓存感知能力。
+static PMU_TYPE: AtomicU64 = AtomicU64::new(0);
+
+fn pmu_type() -> u32 {
+    let cached = PMU_TYPE.load(Ordering::Relaxed);
+    if cached != 0 { return cached as u32; }
+    let t = std::fs::read_to_string("/sys/bus/event_source/devices/armv8_pmuv3/type")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(PERF_TYPE_RAW as u64);
+    PMU_TYPE.store(t, Ordering::Relaxed);
+    t as u32
+}
+
+/// 从 sysfs 读事件编码（如 l2d_cache -> event=0x0016），读不到用默认值
+fn pmu_event(name: &str, fallback: u64) -> u64 {
+    let path = format!("/sys/bus/event_source/devices/armv8_pmuv3/events/{}", name);
+    std::fs::read_to_string(path).ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .find_map(|kv| kv.strip_prefix("event=").map(|v| v.to_string()))
+        })
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(fallback)
+}
+
+/// 缓存事件对 (访问, miss)。按事件源类型选 ARM 或 x86 编码
+fn cache_events() -> (u64, u64) {
+    if pmu_type() == PERF_TYPE_RAW {
+        (X86_LL_CACHE_RD, X86_LL_CACHE_MISS_RD)
+    } else {
+        (pmu_event("l2d_cache", ARM_L2D_CACHE),
+         pmu_event("l2d_cache_refill", ARM_L2D_CACHE_REFILL))
+    }
 }
 
 /// perf_event 是否可用于本进程（快速探测，避免每周期无效开 fd）
